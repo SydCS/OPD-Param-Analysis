@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import csv
 import fnmatch
+import hashlib
 import json
 import math
 import re
+import shlex
 import shutil
+import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -27,7 +31,74 @@ COORD_TOP_PCTS = [0.001, 0.01, 0.05]
 SVD_TOPKS = [1, 2, 4, 8, 16, 32, 64]
 PROJ_RATIOS = [0.01, 0.05, 0.10, 0.20]
 MASK_OVERLAP_RATIOS = [0.01, 0.05, 0.10, 0.20]
+MASK_OVERLAP_UPDATE_ATOLS = [0.0, 1e-5]
 EPS = 1e-12
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def checkpoint_run_metadata(model_dir: Path) -> Dict[str, Any]:
+    """Describe the exact checkpoint files selected for one CLI input."""
+    model_dir = Path(model_dir)
+    info = discover_checkpoint_files(model_dir)
+    files = []
+    total_size_bytes = 0
+    for path in info["files"]:
+        stat = path.stat()
+        total_size_bytes += stat.st_size
+        files.append(
+            {
+                "path": str(path.absolute()),
+                "resolved_path": str(path.resolve()),
+                "size_bytes": int(stat.st_size),
+                "modified_at_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            }
+        )
+    metadata: Dict[str, Any] = {
+        "input_path": str(model_dir.absolute()),
+        "resolved_input_path": str(model_dir.resolve()),
+        "checkpoint_kind": info["kind"],
+        "file_count": len(files),
+        "total_size_bytes": total_size_bytes,
+        "files": files,
+    }
+    if info.get("checkpoint_dir") is not None:
+        metadata["selected_checkpoint_dir"] = str(Path(info["checkpoint_dir"]).resolve())
+    return metadata
+
+
+def _add_dtype_stats(stats: Dict[str, Dict[str, int]], tensor: torch.Tensor) -> None:
+    dtype = str(tensor.dtype).removeprefix("torch.")
+    bucket = stats.setdefault(dtype, {"tensors": 0, "parameters": 0})
+    bucket["tensors"] += 1
+    bucket["parameters"] += int(tensor.numel())
+
+
+def build_run_metadata(args: argparse.Namespace, device: torch.device, analysis_dtype: torch.dtype) -> Dict[str, Any]:
+    script_path = Path(__file__).resolve()
+    return {
+        "started_at_utc": _utc_now(),
+        "script_path": str(script_path),
+        "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
+        "command": shlex.join([sys.executable, *sys.argv]),
+        "source_checkpoint": checkpoint_run_metadata(args.src_model),
+        "trained_checkpoint": checkpoint_run_metadata(args.opd_model),
+        "analysis": {
+            "requested_device": args.device,
+            "effective_device": str(device),
+            "requested_dtype": args.dtype,
+            "effective_dtype": str(analysis_dtype).removeprefix("torch."),
+            "max_exact_svd_dim": args.max_exact_svd_dim,
+            "topk_svd": args.topk_svd,
+            "approx_svd_max_numel": args.approx_svd_max_numel,
+            "mask_overlap_update_atols": args.mask_overlap_update_atols,
+            "make_plots": args.make_plots,
+            "limit_tensors": args.limit_tensors,
+        },
+        "matched_tensor_storage_dtypes": {"source": {}, "trained": {}},
+    }
 
 
 def discover_checkpoint_files(model_dir: Path) -> Dict[str, Any]:
@@ -44,13 +115,37 @@ def discover_checkpoint_files(model_dir: Path) -> Dict[str, Any]:
     if pt_files:
         return {"kind": "torch", "files": pt_files}
 
-    model_world_files = sorted(model_dir.glob("model_world_size_*_rank_*.pt"))
-    if not model_world_files:
-        model_world_files = sorted(model_dir.glob("**/model_world_size_*_rank_*.pt"))
+    direct_model_world_files = sorted(
+        model_dir.glob("model_world_size_*_rank_*.pt"),
+        key=_rank_from_path,
+    )
+    if direct_model_world_files:
+        return {
+            "kind": "dtensor_sharded_torch",
+            "files": direct_model_world_files,
+            "checkpoint_dir": model_dir,
+        }
+
+    model_world_files = sorted(model_dir.glob("**/model_world_size_*_rank_*.pt"))
     if model_world_files:
-        latest = _choose_latest_checkpoint_dir(model_world_files)
-        files = sorted(latest.glob("model_world_size_*_rank_*.pt"), key=_rank_from_path)
-        return {"kind": "dtensor_sharded_torch", "files": files, "checkpoint_dir": latest}
+        checkpoint_dirs = sorted({path.parent for path in model_world_files})
+        # An explicitly supplied global_step_<N> directory normally contains one
+        # nested actor directory. Respect that selection instead of consulting the
+        # training root's latest_checkpointed_iteration.txt.
+        checkpoint_dir = (
+            checkpoint_dirs[0]
+            if len(checkpoint_dirs) == 1
+            else _choose_latest_checkpoint_dir(model_world_files)
+        )
+        files = sorted(
+            checkpoint_dir.glob("model_world_size_*_rank_*.pt"),
+            key=_rank_from_path,
+        )
+        return {
+            "kind": "dtensor_sharded_torch",
+            "files": files,
+            "checkpoint_dir": checkpoint_dir,
+        }
 
     single_pt = sorted(model_dir.glob("*.pt"))
     if single_pt:
@@ -352,15 +447,27 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return mapping[name]
 
 
-def cast_for_delta(src: torch.Tensor, opd: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    src_cast = src.detach().to(dtype).cpu()
-    opd_cast = opd.detach().to(dtype).cpu()
+def cast_for_delta(
+    src: torch.Tensor,
+    opd: torch.Tensor,
+    dtype: torch.dtype,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    target_device = device or torch.device("cpu")
+    src_cast = src.detach().to(device=target_device, dtype=dtype, non_blocking=True)
+    opd_cast = opd.detach().to(device=target_device, dtype=dtype, non_blocking=True)
     delta_cast = opd_cast - src_cast
     return src_cast, opd_cast, delta_cast
 
 
-def compute_tensor_metrics(name: str, src: torch.Tensor, opd: torch.Tensor, analysis_dtype: torch.dtype = torch.float32) -> Dict[str, Any]:
-    src_cast, opd_cast, delta_cast = cast_for_delta(src, opd, analysis_dtype)
+def compute_tensor_metrics(
+    name: str,
+    src: torch.Tensor,
+    opd: torch.Tensor,
+    analysis_dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    src_cast, opd_cast, delta_cast = cast_for_delta(src, opd, analysis_dtype, device)
     src = src_cast.to(torch.float32)
     opd = opd_cast.to(torch.float32)
     delta = delta_cast.to(torch.float32)
@@ -432,7 +539,7 @@ def compute_svd_metrics(
         return None
 
     if min_dim <= max_exact_svd_dim:
-        sigma = torch.linalg.svdvals(delta.to(device)).detach().cpu().float()
+        sigma = torch.linalg.svdvals(delta.to(device)).detach().float()
         row.update(_svd_exact_row(sigma, delta_fro_sq))
         row["svd_mode"] = "exact"
         return row
@@ -448,7 +555,7 @@ def compute_svd_metrics(
 
     q = min(topk_svd, min_dim)
     _, sigma, _ = torch.svd_lowrank(delta.to(device), q=q, niter=2)
-    sigma = sigma.detach().cpu().float()
+    sigma = sigma.detach().float()
     row.update(_svd_approx_row(sigma, delta_fro_sq))
     row["svd_mode"] = "approximate_topk"
     return row
@@ -553,7 +660,9 @@ def compute_base_geometry_metrics(
         _, cos, _ = torch.linalg.svd(uk.T @ uok, full_matrices=False)
         sin_dist = torch.sqrt(torch.clamp(1.0 - cos * cos, min=0.0))
         row[f"top_subspace_rotation_{label}"] = float(sin_dist.mean().item())
-    row["spectral_drift_l2_ratio"] = float(torch.linalg.vector_norm(s_opd - s_src).item() / (torch.linalg.vector_norm(s_src).item() + EPS))
+    spectral_drift_l2 = float(torch.linalg.vector_norm(s_opd - s_src).item())
+    row["spectral_drift_l2_ratio"] = spectral_drift_l2 / (float(torch.linalg.vector_norm(s_src).item()) + EPS)
+    row["spectral_drift_to_delta_fro_ratio"] = spectral_drift_l2 / (math.sqrt(float(delta_fro_sq.item())) + EPS)
     return {k: (v.detach().cpu().item() if isinstance(v, torch.Tensor) else v) for k, v in row.items()}
 
 
@@ -566,31 +675,57 @@ def compute_coordinate_mask_overlap_metrics(
     update_atol: float = 0.0,
     ratios: Sequence[float] = MASK_OVERLAP_RATIOS,
 ) -> Optional[Dict[str, Any]]:
-    """Compare visible update coordinates with source principal/low-magnitude masks."""
+    """Compare one visible-update threshold with source coordinate masks."""
+    rows = compute_coordinate_mask_overlap_metrics_for_thresholds(
+        name,
+        src,
+        delta,
+        device,
+        max_exact_svd_dim,
+        update_atols=[update_atol],
+        ratios=ratios,
+    )
+    return rows[0] if rows else None
+
+
+def compute_coordinate_mask_overlap_metrics_for_thresholds(
+    name: str,
+    src: torch.Tensor,
+    delta: torch.Tensor,
+    device: torch.device,
+    max_exact_svd_dim: int,
+    update_atols: Sequence[float] = MASK_OVERLAP_UPDATE_ATOLS,
+    ratios: Sequence[float] = MASK_OVERLAP_RATIOS,
+) -> List[Dict[str, Any]]:
+    """Compare multiple visible-update thresholds while reusing the source SVD."""
     if src.ndim != 2:
-        return None
+        return []
     m, n = src.shape
     min_dim = min(m, n)
     info = parse_tensor_name(name)
-    row: Dict[str, Any] = {
+    base_row: Dict[str, Any] = {
         "name": name,
         "shape": json.dumps([m, n]),
         **info,
         "mask_overlap_mode": "exact" if min_dim <= max_exact_svd_dim else "skipped",
-        "update_mask_atol": update_atol,
     }
+    rows = [{**base_row, "update_mask_atol": float(update_atol)} for update_atol in update_atols]
     if min_dim > max_exact_svd_dim:
-        row["skipped_reason"] = f"min_dim>{max_exact_svd_dim}"
-        return row
+        for row in rows:
+            row["skipped_reason"] = f"min_dim>{max_exact_svd_dim}"
+        return rows
 
     src_d = src.to(torch.float32).to(device)
     delta_d = delta.to(torch.float32).to(device)
     numel = max(delta_d.numel(), 1)
-    update_mask = delta_d.abs() > update_atol
-    update_count = int(update_mask.sum().item())
-    row["numel"] = int(delta_d.numel())
-    row["update_count"] = update_count
-    row["update_density"] = update_count / numel
+    update_contexts = []
+    for row in rows:
+        update_mask = delta_d.abs() > row["update_mask_atol"]
+        update_count = int(update_mask.sum().item())
+        row["numel"] = int(delta_d.numel())
+        row["update_count"] = update_count
+        row["update_density"] = update_count / numel
+        update_contexts.append((row, update_mask, update_count))
 
     u_src, s_src, vh_src = torch.linalg.svd(src_d, full_matrices=False)
     src_abs = src_d.abs()
@@ -603,16 +738,20 @@ def compute_coordinate_mask_overlap_metrics(
         principal_not_low_mask = principal_mask & ~low_mask
         nonprincipal_or_low_mask = ~principal_mask | low_mask
 
-        row[f"principal_rank_{label}"] = rank
-        _add_mask_overlap_fields(row, f"principal_{label}", principal_mask, update_mask, numel, update_count)
-        _add_mask_overlap_fields(row, f"low_magnitude_{label}", low_mask, update_mask, numel, update_count)
-        _add_mask_overlap_fields(row, f"principal_not_low_{label}", principal_not_low_mask, update_mask, numel, update_count)
-        _add_mask_overlap_fields(row, f"nonprincipal_or_low_{label}", nonprincipal_or_low_mask, update_mask, numel, update_count)
-        row[f"principal_low_intersection_density_{label}"] = _mask_density(principal_mask & low_mask, numel)
+        for row, update_mask, update_count in update_contexts:
+            row[f"principal_rank_{label}"] = rank
+            _add_mask_overlap_fields(row, f"principal_{label}", principal_mask, update_mask, numel, update_count)
+            _add_mask_overlap_fields(row, f"low_magnitude_{label}", low_mask, update_mask, numel, update_count)
+            _add_mask_overlap_fields(row, f"principal_not_low_{label}", principal_not_low_mask, update_mask, numel, update_count)
+            _add_mask_overlap_fields(row, f"nonprincipal_or_low_{label}", nonprincipal_or_low_mask, update_mask, numel, update_count)
+            row[f"principal_low_intersection_density_{label}"] = _mask_density(principal_mask & low_mask, numel)
 
         del score, principal_mask, low_mask, principal_not_low_mask, nonprincipal_or_low_mask
 
-    return {k: (v.detach().cpu().item() if isinstance(v, torch.Tensor) else v) for k, v in row.items()}
+    return [
+        {key: (value.detach().cpu().item() if isinstance(value, torch.Tensor) else value) for key, value in row.items()}
+        for row in rows
+    ]
 
 
 def _fraction_mask(values: torch.Tensor, ratio: float, largest: bool) -> torch.Tensor:
@@ -784,11 +923,13 @@ def write_summary(
     mismatch_report: Dict[str, Any],
     failed_rows: List[Dict[str, Any]],
     extra_warnings: List[str],
+    run_metadata: Dict[str, Any],
 ) -> Dict[str, Any]:
     total_src_energy = float(tensor_df["src_energy"].sum())
     total_opd_energy = float(tensor_df["opd_energy"].sum())
     total_delta_energy = float(tensor_df["delta_energy"].sum())
     summary: Dict[str, Any] = {
+        "run_metadata": run_metadata,
         "total_tensors_analyzed": int(len(tensor_df)),
         "total_parameters_analyzed": int(tensor_df["numel"].sum()),
         "analysis_dtype": str(tensor_df["analysis_dtype"].iloc[0]) if "analysis_dtype" in tensor_df and len(tensor_df) else "unknown",
@@ -807,7 +948,9 @@ def write_summary(
             "failed_tensors": len(failed_rows),
             "approximate_svd_tensors": int((svd_df.get("svd_mode", pd.Series(dtype=str)) == "approximate_topk").sum()) if not svd_df.empty else 0,
             "skipped_base_geometry_tensors": int((base_df.get("base_geometry_mode", pd.Series(dtype=str)) == "skipped").sum()) if not base_df.empty else 0,
-            "skipped_mask_overlap_tensors": int((mask_df.get("mask_overlap_mode", pd.Series(dtype=str)) == "skipped").sum()) if not mask_df.empty else 0,
+            "skipped_mask_overlap_tensors": int(
+                mask_df.loc[mask_df.get("mask_overlap_mode", pd.Series(dtype=str)) == "skipped", "name"].nunique()
+            ) if not mask_df.empty else 0,
             "extra": extra_warnings,
         },
     }
@@ -841,23 +984,35 @@ def write_summary(
             vals = pd.to_numeric(base_df[col], errors="coerce").dropna()
             summary[f"mean_{col}"] = float(vals.mean()) if len(vals) else float("nan")
             summary[f"median_{col}"] = float(vals.median()) if len(vals) else float("nan")
-    for ratio in MASK_OVERLAP_RATIOS:
-        label = _fmt_ratio_label(ratio)
-        for prefix in ("principal", "low_magnitude", "principal_not_low", "nonprincipal_or_low"):
-            col = f"{prefix}_{label}_update_overlap_ratio"
-            if col in mask_df.columns:
-                vals = pd.to_numeric(mask_df[col], errors="coerce").dropna()
-                weights = pd.to_numeric(mask_df.get("update_count", pd.Series(dtype=float)), errors="coerce")
-                if len(vals):
-                    summary[f"mean_{col}"] = float(vals.mean())
-                    summary[f"median_{col}"] = float(vals.median())
-                    summary[f"update_weighted_mean_{col}"] = _weighted_mean(mask_df[col], weights)
-            enrich_col = f"{prefix}_{label}_enrichment_vs_random"
-            if enrich_col in mask_df.columns:
-                vals = pd.to_numeric(mask_df[enrich_col], errors="coerce").dropna()
-                if len(vals):
-                    summary[f"mean_{enrich_col}"] = float(vals.mean())
-                    summary[f"median_{enrich_col}"] = float(vals.median())
+    for col in ("spectral_drift_l2_ratio", "spectral_drift_to_delta_fro_ratio"):
+        if col in base_df.columns:
+            vals = pd.to_numeric(base_df[col], errors="coerce").dropna()
+            summary[f"mean_{col}"] = float(vals.mean()) if len(vals) else float("nan")
+            summary[f"median_{col}"] = float(vals.median()) if len(vals) else float("nan")
+    mask_groups = (
+        list(mask_df.groupby("update_mask_atol", dropna=False))
+        if not mask_df.empty and "update_mask_atol" in mask_df
+        else [(None, mask_df)]
+    )
+    for update_atol, threshold_df in mask_groups:
+        threshold_suffix = "" if update_atol is None else f"_update_atol_{_fmt_update_atol(float(update_atol))}"
+        for ratio in MASK_OVERLAP_RATIOS:
+            label = _fmt_ratio_label(ratio)
+            for prefix in ("principal", "low_magnitude", "principal_not_low", "nonprincipal_or_low"):
+                col = f"{prefix}_{label}_update_overlap_ratio"
+                if col in threshold_df.columns:
+                    vals = pd.to_numeric(threshold_df[col], errors="coerce").dropna()
+                    weights = pd.to_numeric(threshold_df.get("update_count", pd.Series(dtype=float)), errors="coerce")
+                    if len(vals):
+                        summary[f"mean_{col}{threshold_suffix}"] = float(vals.mean())
+                        summary[f"median_{col}{threshold_suffix}"] = float(vals.median())
+                        summary[f"update_weighted_mean_{col}{threshold_suffix}"] = _weighted_mean(threshold_df[col], weights)
+                enrich_col = f"{prefix}_{label}_enrichment_vs_random"
+                if enrich_col in threshold_df.columns:
+                    vals = pd.to_numeric(threshold_df[enrich_col], errors="coerce").dropna()
+                    if len(vals):
+                        summary[f"mean_{enrich_col}{threshold_suffix}"] = float(vals.mean())
+                        summary[f"median_{enrich_col}{threshold_suffix}"] = float(vals.median())
 
     (out_dir / "summary.json").write_text(json.dumps(_jsonable(summary), indent=2), encoding="utf-8")
     write_summary_md(out_dir, summary, summaries, svd_df, base_df, mask_df)
@@ -881,13 +1036,49 @@ def write_summary_md(out_dir: Path, summary: Dict[str, Any], summaries: Dict[str
         f"- Global `isclose(delta, 0, atol=1e-5)` fraction: {_fmt_float(isclose_1e5)}",
         f"- Global `abs(delta) < 1e-5` fraction: {_fmt_float(sparsity)}",
         f"- Global `abs(delta) < 1e-3 * src_rms` fraction: {_fmt_float(rel_sparsity)}",
-        f"- Global top 1% coordinate energy ratio: {_fmt_float(top_coord)}",
+        f"- Tensor-stratified top 1% coordinate energy ratio: {_fmt_float(top_coord)}",
+    ]
+    metadata = summary.get("run_metadata", {})
+    if metadata:
+        source = metadata.get("source_checkpoint", {})
+        trained = metadata.get("trained_checkpoint", {})
+        analysis = metadata.get("analysis", {})
+        dtype_stats = metadata.get("matched_tensor_storage_dtypes", {})
+        lines += [
+            "",
+            "## Run metadata",
+            "",
+            f"- Started (UTC): `{metadata.get('started_at_utc', 'unknown')}`",
+            f"- Completed (UTC): `{metadata.get('completed_at_utc', 'unknown')}`",
+            f"- Source checkpoint: `{source.get('input_path', 'unknown')}`",
+            f"- Trained checkpoint: `{trained.get('input_path', 'unknown')}`",
+            f"- Source format: `{source.get('checkpoint_kind', 'unknown')}` ({source.get('file_count', 0)} files, {_fmt_bytes(source.get('total_size_bytes', 0))})",
+            f"- Trained format: `{trained.get('checkpoint_kind', 'unknown')}` ({trained.get('file_count', 0)} files, {_fmt_bytes(trained.get('total_size_bytes', 0))})",
+            f"- Source storage dtypes among matched tensors: `{json.dumps(dtype_stats.get('source', {}), sort_keys=True)}`",
+            f"- Trained storage dtypes among matched tensors: `{json.dumps(dtype_stats.get('trained', {}), sort_keys=True)}`",
+            f"- Analysis dtype: requested `{analysis.get('requested_dtype', 'unknown')}`, effective `{analysis.get('effective_dtype', 'unknown')}`",
+            f"- Device: requested `{analysis.get('requested_device', 'unknown')}`, effective `{analysis.get('effective_device', 'unknown')}`",
+            f"- Script SHA-256: `{metadata.get('script_sha256', 'unknown')}`",
+            "- Full checkpoint-file manifest and analysis options: `summary.json`",
+            "",
+            "Command:",
+            "",
+            "```sh",
+            metadata.get("command", ""),
+            "```",
+        ]
+        if source.get("resolved_input_path") != source.get("input_path"):
+            lines.insert(lines.index("- Full checkpoint-file manifest and analysis options: `summary.json`"), f"- Resolved source path: `{source.get('resolved_input_path')}`")
+        if trained.get("resolved_input_path") != trained.get("input_path"):
+            lines.insert(lines.index("- Full checkpoint-file manifest and analysis options: `summary.json`"), f"- Resolved trained path: `{trained.get('resolved_input_path')}`")
+
+    lines += [
         "",
         "## Interpretation",
         "",
         f"The final OPD delta has global relative Frobenius norm `{summary['global_relative_delta_norm']:.6g}`. This measures the update scale relative to the source checkpoint, not its downstream usefulness.",
         "",
-        f"Coordinate sparsity should be interpreted cautiously. The exact-zero fraction is `{_fmt_float(exact_zero)}` and `isclose(delta, 0, atol=1e-5)` fraction is `{_fmt_float(isclose_1e5)}`. At strict threshold `abs(delta) < 1e-5`, the fraction below threshold is `{_fmt_float(sparsity)}`; at `1e-3 * src_rms`, it is `{_fmt_float(rel_sparsity)}`. The top 1% coordinate energy ratio is `{_fmt_float(top_coord)}`, indicating how concentrated the squared update energy is in the largest coordinates.",
+        f"Coordinate sparsity should be interpreted cautiously. The exact-zero fraction is `{_fmt_float(exact_zero)}` and `isclose(delta, 0, atol=1e-5)` fraction is `{_fmt_float(isclose_1e5)}`. At strict threshold `abs(delta) < 1e-5`, the fraction below threshold is `{_fmt_float(sparsity)}`; at `1e-3 * src_rms`, it is `{_fmt_float(rel_sparsity)}`. The tensor-stratified top 1% coordinate energy ratio is `{_fmt_float(top_coord)}`: the top 1% is selected separately inside every tensor and the selected energies are then pooled. It is not the result of globally sorting all model coordinates together.",
         "",
         "The modules with the largest delta energy share are:",
     ]
@@ -918,20 +1109,33 @@ def write_summary_md(out_dir: Path, summary: Dict[str, Any], summaries: Dict[str
                 "",
                 f"The median 10% source principal-subspace projection energy ratio is `{vals.median():.6g}` among tensors where exact base geometry was computed. This suggests, but does not prove, how much update energy lies in the leading singular directions of the base weights.",
             ]
+        rho_col = "spectral_drift_to_delta_fro_ratio"
+        rho_vals = pd.to_numeric(base_df.get(rho_col, pd.Series(dtype=float)), errors="coerce").dropna()
+        if len(rho_vals):
+            lines += [
+                "",
+                f"The median singular-value drift relative to update Frobenius norm is `{rho_vals.median():.6g}`. Values near one indicate updates expressed mainly as singular-value magnitude changes; smaller values indicate a larger role for singular-vector/subspace changes.",
+            ]
 
     if not mask_df.empty:
         exact_mask = mask_df[mask_df.get("mask_overlap_mode") == "exact"] if "mask_overlap_mode" in mask_df else mask_df
-        if not exact_mask.empty:
+        threshold_groups = (
+            list(exact_mask.groupby("update_mask_atol", dropna=False))
+            if "update_mask_atol" in exact_mask
+            else [(None, exact_mask)]
+        )
+        for update_atol, threshold_df in threshold_groups:
             principal_col = "principal_10pct_update_overlap_ratio"
             low_col = "low_magnitude_10pct_update_overlap_ratio"
             safe_col = "nonprincipal_or_low_10pct_update_overlap_ratio"
-            if principal_col in exact_mask.columns and low_col in exact_mask.columns:
-                principal = pd.to_numeric(exact_mask[principal_col], errors="coerce").dropna()
-                low = pd.to_numeric(exact_mask[low_col], errors="coerce").dropna()
-                safe = pd.to_numeric(exact_mask.get(safe_col, pd.Series(dtype=float)), errors="coerce").dropna()
+            if principal_col in threshold_df.columns and low_col in threshold_df.columns:
+                principal = pd.to_numeric(threshold_df[principal_col], errors="coerce").dropna()
+                low = pd.to_numeric(threshold_df[low_col], errors="coerce").dropna()
+                safe = pd.to_numeric(threshold_df.get(safe_col, pd.Series(dtype=float)), errors="coerce").dropna()
                 if len(principal) and len(low):
+                    threshold_text = "" if update_atol is None else f" with `abs(delta) > {_fmt_float(update_atol)}`"
                     sentence = (
-                        f"Coordinate-mask overlap at the 10% principal/low-magnitude setting has median update overlap "
+                        f"Coordinate-mask overlap{threshold_text} at the 10% principal/low-magnitude setting has median update overlap "
                         f"`{principal.median():.6g}` for source principal coordinates and `{low.median():.6g}` for source low-magnitude coordinates."
                     )
                     if len(safe):
@@ -960,6 +1164,10 @@ def _fmt_thresh(value: float) -> str:
     return f"{base}e{int(exp)}"
 
 
+def _fmt_update_atol(value: float) -> str:
+    return "0" if value == 0 else _fmt_thresh(value)
+
+
 def _fmt_pct(pct: float) -> str:
     return {0.001: "0p1pct", 0.01: "1pct", 0.05: "5pct"}[pct]
 
@@ -975,6 +1183,15 @@ def _fmt_float(value: Any) -> str:
         return f"{float(value):.6g}"
     except Exception:
         return str(value)
+
+
+def _fmt_bytes(value: Any) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024.0 or unit == "TiB":
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TiB"
 
 
 def _jsonable(obj: Any) -> Any:
@@ -1014,12 +1231,24 @@ def main() -> None:
     parser.add_argument("--src_model", type=Path, required=True)
     parser.add_argument("--opd_model", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, required=True)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Compute device for deltas, sparsity, norms, SVD, and geometry.",
+    )
     parser.add_argument("--dtype", default="bf16", choices=["float32", "bfloat16", "bf16", "float16", "fp16"], help="Arithmetic dtype used before forming parameter deltas.")
-    parser.add_argument("--max_exact_svd_dim", type=int, default=2048)
+    parser.add_argument("--max_exact_svd_dim", type=int, default=4096)
     parser.add_argument("--topk_svd", type=int, default=64)
     parser.add_argument("--approx_svd_max_numel", type=int, default=None, help="Skip approximate SVD for matrices larger than this many elements.")
-    parser.add_argument("--mask_overlap_update_atol", type=float, default=0.0, help="Visible-update mask threshold: abs(delta) > atol.")
+    parser.add_argument(
+        "--mask_overlap_update_atol",
+        dest="mask_overlap_update_atols",
+        type=float,
+        action="append",
+        default=None,
+        metavar="ATOL",
+        help="Visible-update threshold for abs(delta) > atol. Repeat for multiple thresholds; defaults to 0 and 1e-5.",
+    )
     parser.add_argument("--make_plots", action="store_true")
     parser.add_argument("--write_interventions", action="store_true")
     parser.add_argument("--intervention_out_dir", type=Path)
@@ -1034,6 +1263,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     analysis_dtype = _dtype_from_name(args.dtype)
+    args.mask_overlap_update_atols = list(dict.fromkeys(args.mask_overlap_update_atols or MASK_OVERLAP_UPDATE_ATOLS))
+    if any(not math.isfinite(update_atol) or update_atol < 0 for update_atol in args.mask_overlap_update_atols):
+        parser.error("--mask_overlap_update_atol must be finite and non-negative")
+    run_metadata = build_run_metadata(args, device, analysis_dtype)
 
     src_store = load_tensor_map(args.src_model)
     opd_store = load_tensor_map(args.opd_model)
@@ -1063,6 +1296,9 @@ def main() -> None:
             failed_rows.append(_failure(name, "load", exc))
             continue
 
+        _add_dtype_stats(run_metadata["matched_tensor_storage_dtypes"]["source"], src)
+        _add_dtype_stats(run_metadata["matched_tensor_storage_dtypes"]["trained"], opd)
+
         if tuple(src.shape) != tuple(opd.shape):
             mismatch_report["shape_mismatched"].append({"src_name": src_name, "opd_name": opd_name, "src_shape": list(src.shape), "opd_shape": list(opd.shape)})
             continue
@@ -1071,16 +1307,17 @@ def main() -> None:
             continue
 
         try:
-            row = compute_tensor_metrics(name, src, opd, analysis_dtype)
+            row = compute_tensor_metrics(name, src, opd, analysis_dtype, device)
             tensor_rows.append(row)
         except Exception as exc:
             failed_rows.append(_failure(name, "delta_metrics", exc))
             continue
 
-        src_cast, _, delta_cast = cast_for_delta(src, opd, analysis_dtype)
+        src_cast, opd_cast, delta_cast = cast_for_delta(src, opd, analysis_dtype, device)
         src_f = src_cast.to(torch.float32)
         delta = delta_cast.to(torch.float32)
         opd_f = src_f + delta
+        del src_cast, opd_cast, delta_cast
         try:
             svd_row = compute_svd_metrics(name, delta, device, args.max_exact_svd_dim, args.topk_svd, args.approx_svd_max_numel)
             if svd_row:
@@ -1094,9 +1331,16 @@ def main() -> None:
         except Exception as exc:
             failed_rows.append(_failure(name, "base_geometry", exc))
         try:
-            mask_row = compute_coordinate_mask_overlap_metrics(name, src_f, delta, device, args.max_exact_svd_dim, update_atol=args.mask_overlap_update_atol)
-            if mask_row:
-                mask_rows.append(mask_row)
+            mask_rows.extend(
+                compute_coordinate_mask_overlap_metrics_for_thresholds(
+                    name,
+                    src_f,
+                    delta,
+                    device,
+                    args.max_exact_svd_dim,
+                    update_atols=args.mask_overlap_update_atols,
+                )
+            )
         except Exception as exc:
             failed_rows.append(_failure(name, "mask_overlap", exc))
 
@@ -1121,7 +1365,8 @@ def main() -> None:
         df.to_csv(out_dir / f"{name}.csv", index=False)
 
     plot_warnings = make_plots(out_dir, tensor_df, summaries, svd_df, base_df) if args.make_plots else []
-    write_summary(out_dir, tensor_df, summaries, svd_df, base_df, mask_df, mismatch_report, failed_rows, plot_warnings)
+    run_metadata["completed_at_utc"] = _utc_now()
+    write_summary(out_dir, tensor_df, summaries, svd_df, base_df, mask_df, mismatch_report, failed_rows, plot_warnings, run_metadata)
     src_store.close()
     opd_store.close()
 

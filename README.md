@@ -6,7 +6,7 @@ This directory contains a CLI tool for analyzing the final parameter update
 Delta W = W_opd - W_src
 ```
 
-between a source HuggingFace checkpoint and an OPD-trained checkpoint.
+between a source checkpoint and an OPD-trained checkpoint.
 
 Training follows the public implementations and configurations from
 [`verl`](https://github.com/verl-project/verl),
